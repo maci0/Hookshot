@@ -43,11 +43,16 @@ def march_on_linux(text):
         if path == "/proc/cpuinfo":
             return io.StringIO(text)
         return real_open(path, *args, **kwargs)
-    with mock.patch.object(host_cpu.os, "name", "posix"), mock.patch.object(builtins, "open", fake_open):
+    with mock.patch.object(host_cpu.os, "name", "posix"), mock.patch.object(host_cpu.platform, "machine", return_value="x86_64"), \
+            mock.patch.object(builtins, "open", fake_open):
         return host_cpu.host_march()
 
 
 class HostMarch(unittest.TestCase):
+    def test_arm64_uses_native_target(self):
+        with mock.patch.object(host_cpu.os, "name", "posix"), mock.patch.object(host_cpu.platform, "machine", return_value="aarch64"):
+            self.assertEqual(host_cpu.host_march(), "native")
+
     def test_levels_from_cpuinfo(self):
         self.assertEqual(march_on_linux(cpuinfo(HASWELL)), "x86-64-v3")
         self.assertEqual(march_on_linux(cpuinfo(IVY_BRIDGE)), "x86-64-v2")

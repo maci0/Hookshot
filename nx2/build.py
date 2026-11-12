@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -714,9 +715,11 @@ MARCH = os.environ.get("RX_MARCH") or host_march()
 if os.environ.get("RX_MARCH"):
     if MARCH != "x86-64-v3":
         print("build: the game is built for %s (RX_MARCH)" % MARCH, flush=True)
-elif MARCH != "x86-64-v3":
+elif MARCH != "x86-64-v3" and MARCH != "native":
     print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
 CPU = ["-march=" + MARCH, "-ffp-contract=off"]
+if platform.machine().lower() in ("x86_64", "amd64"):
+    CPU.append("-mcx16")
 MTUNE = os.environ.get("RX_MTUNE") or host_mtune()
 if MTUNE:
     CPU += ["-mtune=" + MTUNE]
@@ -726,7 +729,7 @@ OPT = "O1"   # (the lifted code's level; code_hot.c's is RX_HOT_OPT)
 def flags(gen, rt64, opt, polls):
     return target() + CPU + [
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
-        "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
+        "-fno-strict-aliasing", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000",
         # (a compiler's peak memory ~10% lower on a lifted chunk and on a hot piece, clang 23; the lifted code runs as fast)
         "-Xclang", "-disable-lifetime-markers"] + \
@@ -1199,7 +1202,7 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if LINUX:

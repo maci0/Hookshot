@@ -24,10 +24,12 @@ struct Pool {
     VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceAddress address = 0;
     std::vector<VkDeviceMemory> pieces;
 };
-struct { VkDevice device{}; VkPhysicalDeviceMemoryProperties memory{}; bool dma_buf_import = true, sparse_buffers = true; VkDriverId driver_id{}; } dev;
+struct { VkDevice device{}; VkPhysicalDevice physical{}; VkPhysicalDeviceMemoryProperties memory{};
+         bool external_memory_host = true, dma_buf_import = true, sparse_buffers = true; VkDriverId driver_id{}; } dev;
 struct Host { uint8_t* guest_base() { static uint8_t bytes[4096]{}; return bytes; } } host_value;
 Host* host = &host_value;
 uint64_t max_import_size = UINT64_MAX;
+uint64_t align = 0;
 bool import_cooling = false;
 VkResult import_result = VK_SUCCESS;
 mkwvk::ImportHolds import_holds;
@@ -45,6 +47,18 @@ std::vector<char> release_order;
 constexpr VkBufferUsageFlags kUsage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 bool failing(Fault f, int kind) { return fault == f && (fail_kind == EveryMemory || fail_kind == kind); }
 void logf(const char*, ...) {}
+void vkGetPhysicalDeviceProperties2(VkPhysicalDevice, VkPhysicalDeviceProperties2* p) {
+    for (auto* q = static_cast<VkBaseOutStructure*>(p->pNext); q; q = q->pNext) {
+        if (q->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT) {
+            assert(dev.external_memory_host);
+            reinterpret_cast<VkPhysicalDeviceExternalMemoryHostPropertiesEXT*>(q)->minImportedHostPointerAlignment = 65536;
+        } else if (q->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES) {
+            reinterpret_cast<VkPhysicalDeviceVulkan11Properties*>(q)->maxMemoryAllocationSize = 1ull << 30;
+        } else if (q->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES) {
+            reinterpret_cast<VkPhysicalDeviceVulkan13Properties*>(q)->maxBufferSize = 2ull << 30;
+        }
+    }
+}
 const char* getenv(const char*) { return nullptr; }
 bool env_on(const char* name) { const char* v = getenv(name); return v && !env_value_off(v); }   // (the switches through the stand-in)
 using SIZE_T = size_t;
@@ -127,6 +141,16 @@ bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t, Pool& p) {
 #undef fscanf
 
 void empty() { assert(buffers.empty() && memories.empty() && bound_buffers.empty()); }
+void run_init(const std::string& test) {
+    dev.external_memory_host = test == "host";
+    dev.dma_buf_import = test == "dma";
+    const bool supported = test != "none";
+    assert(memory_init() == supported);
+    if (supported) {
+        assert(align == (dev.external_memory_host ? 65536u : 4096u));
+        assert(max_import_size == (1ull << 30));
+    }
+}
 void release(Pool& p) {
     vkDestroyBuffer(dev.device, p.buffer, nullptr); vkFreeMemory(dev.device, p.memory, nullptr);
     for (auto m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
@@ -195,5 +219,7 @@ void run(const std::string& route, const std::string& test) {
 }
 } // namespace fixture
 int main(int argc, char** argv) {
-    assert(argc == 3); fixture::run(argv[1], argv[2]); return 0;
+    if (argc == 3 && std::string(argv[1]) == "init") fixture::run_init(argv[2]);
+    else { assert(argc == 3); fixture::run(argv[1], argv[2]); }
+    return 0;
 }

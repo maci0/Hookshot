@@ -2,9 +2,12 @@
 CPU without x86-64-v3's features (AVX2, FMA, BMI2, MOVBE) gets x86-64-v2, or the x86-64 baseline. RX_MARCH, read by
 build.py, still chooses."""
 import os
+import platform
 
 
 def host_march():
+    if os.name != "nt" and platform.machine().lower() in ("aarch64", "arm64"):
+        return "native"
     want = ("avx2", "fma", "bmi2", "movbe")
     try:
         if os.name == "nt":

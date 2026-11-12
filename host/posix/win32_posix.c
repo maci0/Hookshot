@@ -15,6 +15,9 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <ucontext.h>
+#if defined(__aarch64__)
+#include <asm/sigcontext.h>
+#endif
 
 /* the guest window (third_party/a64-kit/rt/a64.h A64_HOST_BASE, host/hos.h HOS_GUEST_SPACE): one mapping, all of it
    readable and writable, which VirtualQuery reports as committed without asking the kernel */
@@ -1115,21 +1118,51 @@ static struct sigaction previous[32];
 static pthread_mutex_t handlers_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void context_from(CONTEXT *c, const ucontext_t *uc) {
+#if defined(__aarch64__)
+    memset(c, 0, sizeof *c);
+    c->Rax = uc->uc_mcontext.regs[0];
+    c->Rbp = uc->uc_mcontext.regs[29];
+    c->Rsp = uc->uc_mcontext.sp;
+    c->Rip = uc->uc_mcontext.pc;
+    c->ContextFlags = CONTEXT_FULL;
+#else
     const greg_t *g = uc->uc_mcontext.gregs;
     c->Rax = (DWORD64)g[REG_RAX], c->Rcx = (DWORD64)g[REG_RCX], c->Rdx = (DWORD64)g[REG_RDX], c->Rbx = (DWORD64)g[REG_RBX];
     c->Rsp = (DWORD64)g[REG_RSP], c->Rbp = (DWORD64)g[REG_RBP], c->Rsi = (DWORD64)g[REG_RSI], c->Rdi = (DWORD64)g[REG_RDI];
     c->R8 = (DWORD64)g[REG_R8], c->R9 = (DWORD64)g[REG_R9], c->R10 = (DWORD64)g[REG_R10], c->R11 = (DWORD64)g[REG_R11];
     c->R12 = (DWORD64)g[REG_R12], c->R13 = (DWORD64)g[REG_R13], c->R14 = (DWORD64)g[REG_R14], c->R15 = (DWORD64)g[REG_R15];
     c->Rip = (DWORD64)g[REG_RIP], c->EFlags = (DWORD)g[REG_EFL], c->ContextFlags = CONTEXT_FULL;
+#endif
 }
 static void context_to(ucontext_t *uc, const CONTEXT *c) {
+#if defined(__aarch64__)
+    uc->uc_mcontext.regs[0] = c->Rax;
+    uc->uc_mcontext.regs[29] = c->Rbp;
+    uc->uc_mcontext.sp = c->Rsp;
+    uc->uc_mcontext.pc = c->Rip;
+#else
     greg_t *g = uc->uc_mcontext.gregs;
     g[REG_RAX] = (greg_t)c->Rax, g[REG_RCX] = (greg_t)c->Rcx, g[REG_RDX] = (greg_t)c->Rdx, g[REG_RBX] = (greg_t)c->Rbx;
     g[REG_RSP] = (greg_t)c->Rsp, g[REG_RBP] = (greg_t)c->Rbp, g[REG_RSI] = (greg_t)c->Rsi, g[REG_RDI] = (greg_t)c->Rdi;
     g[REG_R8] = (greg_t)c->R8, g[REG_R9] = (greg_t)c->R9, g[REG_R10] = (greg_t)c->R10, g[REG_R11] = (greg_t)c->R11;
     g[REG_R12] = (greg_t)c->R12, g[REG_R13] = (greg_t)c->R13, g[REG_R14] = (greg_t)c->R14, g[REG_R15] = (greg_t)c->R15;
     g[REG_RIP] = (greg_t)c->Rip;
+#endif
 }
+#if defined(__aarch64__)
+static int fault_is_write(const ucontext_t *uc) {
+    const unsigned char *p = uc->uc_mcontext.__reserved;
+    const unsigned char *end = p + sizeof uc->uc_mcontext.__reserved;
+    while (p + sizeof(struct _aarch64_ctx) <= end) {
+        const struct _aarch64_ctx *h = (const struct _aarch64_ctx *)p;
+        if (!h->magic || h->size < sizeof *h || h->size > (size_t)(end - p)) break;
+        if (h->magic == ESR_MAGIC && h->size >= sizeof(struct esr_context))
+            return (((const struct esr_context *)p)->esr >> 6) & 1;
+        p += h->size;
+    }
+    return 0;
+}
+#endif
 static void on_signal(int sig, siginfo_t *si, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     EXCEPTION_RECORD rec;
@@ -1142,7 +1175,11 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
     rec.ExceptionAddress = (void *)(uintptr_t)ctx.Rip;
     if (sig == SIGSEGV || sig == SIGBUS) {
         rec.NumberParameters = 2;
+#if defined(__aarch64__)
+        rec.ExceptionInformation[0] = fault_is_write(uc);
+#else
         rec.ExceptionInformation[0] = (uc->uc_mcontext.gregs[REG_ERR] & 2) ? 1 : 0;   /* (1: a write) */
+#endif
         rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
     }
     EXCEPTION_POINTERS ep = {&rec, &ctx};

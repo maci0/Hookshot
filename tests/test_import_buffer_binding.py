@@ -25,7 +25,7 @@ def main():
     source = (a.source / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
     owner_release = block(source, "void destroy_import_buffer(") if "void destroy_import_buffer(" in source else ""
     actual = owner_release + "\n" + "\n".join(block(source, marker) for marker in [
-        "bool import_on_hold(", "void import_remember_failure(", "bool import_dma_buf(", "bool import_pool("])
+        "bool import_on_hold(", "void import_remember_failure(", "bool import_dma_buf(", "bool import_pool(", "bool memory_init("])
     # Select both platform routes independently of the machine running the game-free test.
     assert actual.count("#ifdef __linux__") == 1
     actual = actual.replace("#ifdef __linux__", "#if TEST_DMA_FALLBACK")
@@ -49,7 +49,9 @@ def main():
             if platform:
                 for case in ["dma-bind-fallback", "dma-create-fallback", "dma-allocate-fallback", "both-bind-fail", "nvidia"]:
                     subprocess.run([str(exe), "pool", case], check=True, timeout=15)
-    print(f"{len(cases) * 2 + 5} factory/rollback/fallback/hold cases passed")
+            for case in ["host", "dma", "none"]:
+                subprocess.run([str(exe), "init", case], check=True, timeout=15)
+    print(f"{len(cases) * 2 + 11} factory/rollback/fallback/hold/init cases passed")
 
 
 if __name__ == "__main__":
