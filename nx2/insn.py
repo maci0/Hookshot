@@ -73,6 +73,11 @@ def lse(w):
         fn, arg = {"add": ("__atomic_fetch_add", s), "clr": ("__atomic_fetch_and", "(%s)~%s" % (T, s)),
                    "eor": ("__atomic_fetch_xor", s), "set": ("__atomic_fetch_or", s)}[op]
         body = "%s _o = %s(_p, %s, __ATOMIC_SEQ_CST);" % (T, fn, arg)
+        if op == "add" and n == 4:
+            # OoT's packed refcount at offset 209 faults on Snapdragon's unaligned LSE.
+            body = ("\n#if defined(__aarch64__)\nextern uint32_t a64_unaligned_fetch_add32(void *, uint32_t);\n"
+                    "uint32_t _o = __builtin_expect((_a & 3) != 0, 0) ? a64_unaligned_fetch_add32(_p, %s) : "
+                    "__atomic_fetch_add(_p, %s, __ATOMIC_SEQ_CST);\n#else\n%s\n#endif\n" % (s, s, body))
     else:
         cmp = {"smax": "(%s)_o > (%s)_s" % (S, S), "smin": "(%s)_o < (%s)_s" % (S, S),
                "umax": "_o > _s", "umin": "_o < _s"}[op]

@@ -1232,10 +1232,24 @@ uint64_t translator_stamp() {
 }
 namespace {
 
+// Keep the per-program override active for every stage, including mesh fallback, and restore it on failure.
+struct ScopedGmPort {
+    bool previous = Shader::Optimization::g_gm_port_this;
+    explicit ScopedGmPort(uint64_t key) {
+        char hex[24];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
+        Shader::Optimization::g_gm_port_this = key_listed(hex, "EDEN_NX2_GM_PORT_PROGS");
+        if (Shader::Optimization::g_gm_port_this)
+            logf("vk: program %s: the Fritchii tracking (EDEN_NX2_GM_PORT_PROGS)", hex);
+    }
+    ~ScopedGmPort() { Shader::Optimization::g_gm_port_this = previous; }
+};
+
 void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* fsc, const Code* csc,
                     const uint8_t color_types[8]) {
     const auto t0 = std::chrono::steady_clock::now();
     QuestionsNoted noted{p};
+    ScopedGmPort gm_port{p.key};
     ptr_diag_reset();
     try {
         Shader::Backend::Bindings bindings{};
@@ -1265,15 +1279,12 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                     }
                 Shader::Optimization::g_all_global_this = all_global;
                 if (all_global) logf("vk: program %s: every memory access left global (RX_VK_ALL_GLOBAL_PROGS)", hex);
-                Shader::Optimization::g_gm_port_this = key_listed(hex, "EDEN_NX2_GM_PORT_PROGS");
-                if (Shader::Optimization::g_gm_port_this) logf("vk: program %s: the Fritchii tracking (EDEN_NX2_GM_PORT_PROGS)", hex);
             }
             struct ResetTable {
                 ~ResetTable() {
                     Shader::Optimization::g_nvn2_compute_ssbo_base = 0, Shader::Optimization::g_nvn2_compute_ssbo_count = 16;
                     Shader::Optimization::g_nvn2_compute_layout_end = 0;
                     Shader::Optimization::g_all_global_this = false;
-                    Shader::Optimization::g_gm_port_this = false;
                 }
             } reset_table;
             auto t = translate(env, false);
@@ -1483,6 +1494,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                          const Code* fsc, const uint8_t color_types[8]) {
     const auto t0 = std::chrono::steady_clock::now();
     QuestionsNoted noted{p};
+    ScopedGmPort gm_port{p.key};
     ptr_diag_reset();
     {   // (EvilOOT, RX_VK_MISS_LOG_PROG=<key prefix>: the miss log for that program only)
         static const char* only = getenv("RX_VK_MISS_LOG_PROG");

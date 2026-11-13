@@ -319,7 +319,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     InitializeSRWLock(&d->lock);
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
-        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 8 : 4;   /* (1080p AV1 in software) */
+        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? env_int("HOS_DAV1D_THREADS", 8) : 4;
         if (avcodec_open2(d->ctx, codec, NULL) < 0) avcodec_free_context(&d->ctx);
     }
     for (size_t i = 0; !d->ctx && !d->mf && id == AV_CODEC_ID_AV1 && i < sizeof av1_decoders / sizeof av1_decoders[0]; i++)

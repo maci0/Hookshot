@@ -91,6 +91,8 @@ def main():
     insn_test.mem_regs = mem_regs
     base_target = toolchain.native_target
     toolchain.native_target = lambda *a, **k: base_target(*a, **k) + ["-mcx16"]
+    base_link = toolchain.native_link
+    toolchain.native_link = lambda *a, **k: base_link(*a, **k) + [os.path.join(os.path.dirname(__file__), "rt", "unaligned_atomic.c")]
     base_sample = insn_test.sample
 
     def sample(image_dir, mods, per, rng):

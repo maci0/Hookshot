@@ -563,24 +563,29 @@ NV(nvnTextureBuilderSetDefaults) {
 NV(nvnTextureBuilderSetDevice) { TB(P(0))->dev = P(1); }
 NV(nvnTextureBuilderSetFlags) { TB(P(0))->d.flags = I(1); }
 NV(nvnTextureBuilderSetTarget) { TB(P(0))->d.target = I(1); }
-NV(nvnTextureBuilderSetWidth) { TB(P(0))->d.width = U32(1); }
-NV(nvnTextureBuilderSetHeight) { TB(P(0))->d.height = U32(1); }
+static void size_trace(Ctx *c, uint32_t w, uint32_t h, const char *call) {
+    /* HOS_SIZE_TRACE=1: large sizes; =<width>: trace that exact size. */
+    static int on = -1, exact = 0;
+    static volatile LONG left = 24;
+    if (on < 0) {
+        const char *e = getenv("HOS_SIZE_TRACE");
+        exact = e ? atoi(e) : 0;
+        on = env_on("HOS_SIZE_TRACE");
+    }
+    if (on && (exact > 1 ? w == (uint32_t)exact && h > 1 : (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920)) && InterlockedDecrement(&left) >= 0) {
+        void hos_backtrace(void);
+        hos_log("nvn: texture size %ux%u via %s (lr %#llx)", w, h, call, (unsigned long long)c->x[30]);
+        hos_backtrace();
+    }
+}
+NV(nvnTextureBuilderSetWidth) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); size_trace(c, b->d.width, b->d.height, "SetWidth"); }
+NV(nvnTextureBuilderSetHeight) { nvn_tex_builder *b = TB(P(0)); b->d.height = U32(1); size_trace(c, b->d.width, b->d.height, "SetHeight"); }
 NV(nvnTextureBuilderSetDepth) { TB(P(0))->d.depth = U32(1); }
 NV(nvnTextureBuilderSetSize1D) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); b->d.height = b->d.depth = 1; }
 NV(nvnTextureBuilderSetSize2D) {
     nvn_tex_builder *b = TB(P(0));
     b->d.width = U32(1), b->d.height = U32(2), b->d.depth = 1;
-    {   /* (hookshot) HOS_SIZE_TRACE=1: who asks for the picture's sizes (the output and the scene: for wider screens) */
-        static int on = -1;
-        static volatile LONG left = 24;
-        if (on < 0) on = env_on("HOS_SIZE_TRACE");
-        const uint32_t w = U32(1);
-        if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920) && InterlockedDecrement(&left) >= 0) {
-            void hos_backtrace(void);
-            hos_log("nvn: texture size %ux%u (lr %#llx)", w, U32(2), (unsigned long long)c->x[30]);
-            hos_backtrace();
-        }
-    }
+    size_trace(c, b->d.width, b->d.height, "SetSize2D");
 }
 NV(nvnTextureBuilderSetSize3D) { nvn_tex_builder *b = TB(P(0)); b->d.width = U32(1); b->d.height = U32(2); b->d.depth = U32(3); }
 NV(nvnTextureBuilderSetLevels) { TB(P(0))->d.levels = U32(1); }
@@ -3155,6 +3160,12 @@ static void unimplemented(Ctx *c, void *name) {
     RET(strstr((const char *)name, "Initialize") ? 1 : 0);
 }
 static int cmp_impl(const void *a, const void *b) { return strcmp(((const nvn_impl *)a)->name, ((const nvn_impl *)b)->name); }
+/* Native ARM64 callers use this implementation directly through a register-to-Ctx bridge. */
+void *hos_nvn_host_impl(const char *name) {
+    for (size_t i = 0; i < sizeof impls / sizeof *impls; i++)
+        if (!strcmp(name, impls[i].name)) return (void *)impls[i].fn;
+    return NULL;
+}
 uint64_t nvn_native_proc(const char *name) {
     static nvn_impl *sorted;
     static uint64_t *addr;

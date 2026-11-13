@@ -1146,7 +1146,7 @@ def main():
     srcs = [os.path.join(gen, c) for c in chunks]
     host_srcs = []
     srcs += [os.path.join(gen, f) for f in ("a64_table.c", "a64_hooks.c", "a64_suyu.c")] + \
-            [os.path.join(rt64, "a64_rt.c")]
+            [os.path.join(rt64, "a64_rt.c"), os.path.join(NX2_RT, "unaligned_atomic.c")]
     if a.standalone:
         srcs += [os.path.join(gen, f) for f in ("a64_stubs.c", "hos_image.c", "nvn2_exports.c")]
         # (EvilOOT) host/rx_nowgpu.c stands in for the WebGPU renderer only when there is no wgpu-native to build it with (Linux has
@@ -1450,7 +1450,10 @@ def main():
         t = time.time()
         # (--export-dynamic-symbol: the window's state, which the Vulkan back end's own Win32 calls read by name)
         r = run_link([cc] + target() + ["-fuse-ld=lld", "-o", exe] + linker("-Map=" + exe + ".map") +
-                     ["-Wl,--gc-sections", "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
+                     ["-Wl,--gc-sections", "-Wl,--export-dynamic-symbol=hos_posix_*",
+                      "-Wl,--export-dynamic-symbol=hos_nvn_host_impl",
+                      "-Wl,--export-dynamic-symbol=rx_option",
+                      "-Wl,--export-dynamic-symbol=dm_linux_slots", "@" + rsp] + HOT_ORDER() +
                      (["-fprofile-instr-generate"] if PGO == "gen" else []) +
                      (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS, exe)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

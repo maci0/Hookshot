@@ -36,7 +36,7 @@
 #define SPLICE_AFTER_EACH(addr, anchor) void splice_##addr(Ctx *c)
 #define ARG(n) (c->x[n])
 #define RET(v) (c->x[0] = (uint64_t)(v))
-#define GP(a) ((void *)A64_PTR(a))           /* host pointer of a guest address */
+#define GP(a) ((void *)(A64_MEM + (uint64_t)(a))) /* host pointer of a guest address, including addresses above 4 GB */
 #define G64(a) (*(uint64_t *)GP(a))
 #define G32(a) (*(uint32_t *)GP(a))
 

@@ -13,7 +13,7 @@ namespace mkwvk {
 namespace {
 
 constexpr int kSlots = 48;                // (vk_replay.cpp's kRecordings)
-constexpr uint32_t kQ = 2048;             // timestamps a command buffer can take in a recording
+constexpr uint32_t kQ = 8192;             // OoT's gameplay recordings exhaust 2048 timestamps and lose pass costs
 VkQueryPool pool = VK_NULL_HANDLE;
 struct Span {
     std::string label;
@@ -136,7 +136,12 @@ void gprof_run(VkCommandBuffer cmd, uint64_t key) {
         st->spans[st->run].items++;
         return;
     }
-    if (st->nq + 3 > kQ) return;
+    if (st->nq + 3 > kQ) {
+        // Close the previous program before untimed draws can be charged to it; reserve the pass's end query.
+        if (st->run >= 0) st->spans[st->run].qe = stamp(*st, cmd), st->run = -1;
+        dropped++;
+        return;
+    }
     const uint32_t q = stamp(*st, cmd);
     if (st->run >= 0) st->spans[st->run].qe = q;
     Span sp;

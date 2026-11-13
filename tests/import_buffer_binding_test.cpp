@@ -75,6 +75,7 @@ struct ImportFence {
 };
 size_t VirtualQuery(void*, MEMORY_BASIC_INFORMATION*, size_t) { return 0; }
 VkResult vkGetMemoryHostPointerPropertiesEXT(VkDevice, VkExternalMemoryHandleTypeFlagBits, const void*, VkMemoryHostPointerPropertiesEXT* hp) {
+    assert(dev.external_memory_host);
     if (fault == Fault::Properties) return VK_ERROR_OUT_OF_HOST_MEMORY;
     hp->memoryTypeBits = 1; return VK_SUCCESS;
 }
@@ -171,6 +172,19 @@ void run(const std::string& route, const std::string& test) {
     if (test == "properties-error") fault = Fault::Properties;
     if (route == "pool" && test != "both-bind-fail") fail_kind = DmaMemory;
     Pool p;
+    if (test == "dma-only-failure") {
+        dev.external_memory_host = false;
+        fault = Fault::Create;
+        assert(!call(route, p));
+        assert(creates == 1 && allocations == 0 && address_queries == 0);
+        assert(import_holds.rows.size() == 1);
+        empty();
+        fault = Fault::None;
+        assert(!call(route, p) && import_cooling && creates == 1);
+        now_ms += mkwvk::ImportHolds::kGapMs;
+        assert(call(route, p) && buffers.at(p.buffer) == DmaMemory);
+        release(p); return;
+    }
     if (test == "nvidia") {   // (NVIDIA's driver refuses the window's dma-bufs: no udmabuf opened, no dma-buf tried, host pointers)
         dev.driver_id = VK_DRIVER_ID_NVIDIA_PROPRIETARY;
         if (route == "dma") {

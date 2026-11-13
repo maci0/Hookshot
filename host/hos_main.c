@@ -39,6 +39,7 @@ const char *hos_version(void) { return HOOKSHOT_VERSION; }   /* (discord_rpc.c's
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <dlfcn.h>
 #endif
 /* (linux) the separator of the paths the executable's folder is joined with */
 #ifdef _WIN32
@@ -160,6 +161,7 @@ static int reserve_guest(void) {
            size_limit_mb (64 MB unless raised) is imported as several dma-bufs bound into one sparse buffer, so no setting is
            needed. HOS_GUEST_MEMFD=1: the memfd all the same) */
         const char *e = getenv("HOS_GUEST_MEMFD");
+        const int native_alias = env_on("HOS_NATIVE_GUEST_ALIAS");
         int usable = 0;
         unsigned long long limit_mb = 0;
         {
@@ -190,13 +192,28 @@ static int reserve_guest(void) {
                 hos_log("mem: guest memory stays host-pointer imports for the GPU (slow submissions on AMD): %s",
                         u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb cannot be read");
         }
-        if (e ? atoi(e) != 0 : usable) {
+        if (native_alias || (e ? atoi(e) != 0 : usable)) {
             const int fd = (int)syscall(SYS_memfd_create, "hookshot-guest", 1u /* MFD_CLOEXEC */ | 2u /* MFD_ALLOW_SEALING */);
             if (fd >= 0 && ftruncate(fd, (off_t)GUEST_SPACE) == 0) {
                 fcntl(fd, 1033 /* F_ADD_SEALS */, 0x0002 /* F_SEAL_SHRINK */ | 0x0004 /* F_SEAL_GROW */);
                 void *p = mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
                                MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, fd, 0);
                 if (p == (void *)A64_HOST_BASE) {
+                    if (native_alias) {
+                        const size_t low_start = 1ull << 20;   /* leave Linux's protected null page unmapped */
+                        void *low = mmap((void *)low_start, GUEST_SPACE - low_start, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, fd, low_start);
+                        if (low != (void *)low_start) {
+                            const int err = errno;
+                            if (low != MAP_FAILED) munmap(low, GUEST_SPACE - low_start);
+                            munmap(p, GUEST_SPACE);
+                            close(fd);
+                            hos_log("mem: HOS_NATIVE_GUEST_ALIAS cannot map low guest addresses (errno %d)", err);
+                            return 0;
+                        }
+                        hos_log("mem: native guest address alias mapped from %#zx to %#llx", low_start,
+                                (unsigned long long)GUEST_SPACE);
+                    }
                     hos_guest_memfd = fd;
                     hos_log("mem: the guest window is a memfd's (%d), shared with the GPU as dma-bufs", fd);
                     return 1;
@@ -204,6 +221,7 @@ static int reserve_guest(void) {
                 if (p != MAP_FAILED) munmap(p, GUEST_SPACE);
             }
             if (fd >= 0) close(fd);
+            if (native_alias) return 0;
             hos_log("mem: no memfd for the guest window (errno %d): anonymous memory", errno);
         }
     }
@@ -227,6 +245,10 @@ static int reserve_guest(void) {
 /* the guest window's memfd for the Vulkan back end (-1: anonymous memory), and freeing guest pages so that
    they read as zero again on either kind of mapping */
 int hos_guest_memfd = -1;
+#ifdef __linux__
+/* Fixed TPIDR_EL0 offsets for NxNative's rewritten ARM64 code loaded from a shared library. */
+__thread uint64_t dm_linux_slots[4];
+#endif
 int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
 int hos_posix_guest_discard(void *p, size_t n) {
     return madvise(p, n, hos_guest_memfd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
@@ -1904,6 +1926,21 @@ static int game_main(int argc, char **argv) {
     if (env_on("HOS_TRACE")) hos_trace = 1;
     if (!hos_user_dir) hos_user_dir = "user";
     CreateDirectoryA(hos_user_dir, NULL);
+#ifndef _WIN32
+    int (*native_run)(const char *) = NULL;
+    if (env_on("HOS_NATIVE_CPU")) {
+        const char *so = getenv("HOS_NATIVE_HOST_SO");
+        if (!so || !*so || !getenv("HOS_NATIVE_MODULE_DIR"))
+            hos_fatal(NULL, "HOS_NATIVE_CPU needs HOS_NATIVE_HOST_SO and HOS_NATIVE_MODULE_DIR");
+        setenv("HOS_NATIVE_GUEST_ALIAS", "1", 1);
+        setenv("DM_NATIVE_GUEST_ALIAS", "1", 1);
+        setenv("DM_NVN_HOOKSHOT", "1", 1);
+        void *lib = dlopen(so, RTLD_NOW | RTLD_LOCAL);
+        if (!lib) hos_fatal(NULL, "native host %s: %s", so, dlerror());
+        native_run = (int (*)(const char *))dlsym(lib, "dm_linux_run");
+        if (!native_run) hos_fatal(NULL, "native host %s has no dm_linux_run", so);
+    }
+#endif
     if (!reserve_guest()) {
         fprintf(stderr, "cannot reserve the guest window\n");
         return 1;
@@ -2020,6 +2057,13 @@ static int game_main(int argc, char **argv) {
 #endif
     void hos_display_start(void);
     hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */
+#ifndef _WIN32
+    if (native_run) {
+        const char *dir = getenv("HOS_NATIVE_MODULE_DIR");
+        hos_log("boot: native ARM64 host, modules %s", dir);
+        return native_run(dir);
+    }
+#endif
     /* nn::init::Start's order (sdk+0xfa060), with rtld's three callbacks done here: f1 only marks rtld initialized,
        f2 is every module's DT_INIT, f3 the DT_FINIs (not needed: we never return from nnMain to unload). */
     call_guest(c, hos_entry_init_libc0, sp, "_init_libc0");

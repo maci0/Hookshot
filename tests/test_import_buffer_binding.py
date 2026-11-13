@@ -47,11 +47,11 @@ def main():
             for route, case in cases:
                 subprocess.run([str(exe), route, case], check=True, timeout=15)
             if platform:
-                for case in ["dma-bind-fallback", "dma-create-fallback", "dma-allocate-fallback", "both-bind-fail", "nvidia"]:
+                for case in ["dma-bind-fallback", "dma-create-fallback", "dma-allocate-fallback", "both-bind-fail", "nvidia", "dma-only-failure"]:
                     subprocess.run([str(exe), "pool", case], check=True, timeout=15)
             for case in ["host", "dma", "none"]:
                 subprocess.run([str(exe), "init", case], check=True, timeout=15)
-    print(f"{len(cases) * 2 + 11} factory/rollback/fallback/hold/init cases passed")
+    print(f"{len(cases) * 2 + 12} factory/rollback/fallback/hold/init cases passed")
 
 
 if __name__ == "__main__":

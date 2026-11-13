@@ -188,9 +188,15 @@ void pin_subgroup(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0)
         r.requiredSubgroupSize = 32;
         return r;
     }();
-    if (!(dev.sg32_stages & st.stage)) return;
-    st.pNext = &size;
-    if (workgroup_x && !(workgroup_x % 32) && dev.vk13.computeFullSubgroups)
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size64 = [] {
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        r.requiredSubgroupSize = 64;
+        return r;
+    }();
+    const auto *required = (dev.sg32_stages & st.stage) ? &size : (dev.sg64_stages & st.stage) ? &size64 : nullptr;
+    if (!required) return;
+    st.pNext = required;
+    if (workgroup_x && !(workgroup_x % required->requiredSubgroupSize) && dev.vk13.computeFullSubgroups)
         st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
 }
 
@@ -6498,6 +6504,9 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
     auto send = [&](size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
+        char label[80];
+        snprintf(label, sizeof label, "fallback %s prog %016llx", mesh_stage ? "mesh" : "task", (unsigned long long)p.key);
+        GprofSpan timed(cmd, label);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
         if (mesh_stage && p.fallback_task) {
             // (the mesh workgroups the task's started threads counted into the records' header, each its slot in the map:
