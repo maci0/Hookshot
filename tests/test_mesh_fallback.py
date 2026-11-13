@@ -142,6 +142,11 @@ def main():
     draw = DRAW.read_text(encoding="utf-8")
     if "bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d)" not in draw:
         raise SystemExit("vk_draw.cpp has no fallback dispatch")
+    send = block(draw, "auto send = [&](size_t stage, bool mesh_stage)")
+    if '"fallback %s prog %016llx"' not in send or 'mesh_stage ? "mesh" : "task"' not in send:
+        raise SystemExit("GPU profiling does not identify each fallback stage and program")
+    if not send.index("GprofSpan timed(cmd, label);") < send.index("vkCmdDispatchIndirect("):
+        raise SystemExit("the fallback dispatch is outside its GPU timing scope")
     if "vkCmdDispatchIndirect(cmd, mesh_conv_buf, mesh_conv_off);" not in draw:
         raise SystemExit("an indirect mesh draw does not dispatch from its converted arguments")
     if "batch.first_task += (uint32_t)batch.groups[0];" not in draw or \
