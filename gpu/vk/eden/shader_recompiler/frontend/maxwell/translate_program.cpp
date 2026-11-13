@@ -112,10 +112,22 @@ void AddGlobalTables(IR::Program& program) {
     // entries, the culling setup's count writes went through the pool's binding and the launches never saw them.
     // (hookshot, as Lichii #421) none past MAX_SSBOS: the list is a static_vector, and one more threw bad_alloc
     const auto room{[&] { return program.info.storage_buffers_descriptors.size() < Info::MAX_SSBOS; }};
+    const size_t first_table{program.info.storage_buffers_descriptors.size()};
     for (u32 i = 0; i < program.info.num_global_tables && room(); ++i) {
+        const auto [index, offset] = program.info.global_tables[i];
+        if (program.info.storage_buffers_descriptors.size() > first_table) {
+            auto& previous = program.info.storage_buffers_descriptors.back();
+            // Overlapping entries bind the same words and write policy; keep their first-match order without searching twice.
+            if (previous.cbuf_index == index && offset >= previous.cbuf_offset &&
+                (offset - previous.cbuf_offset) % 16U == 0 &&
+                (offset - previous.cbuf_offset) / 16U <= previous.count) {
+                previous.count = std::max(previous.count, (offset - previous.cbuf_offset) / 16U + Info::kGlobalTableSize);
+                continue;
+            }
+        }
         program.info.storage_buffers_descriptors.push_back({
-            .cbuf_index = program.info.global_tables[i].first,
-            .cbuf_offset = program.info.global_tables[i].second,
+            .cbuf_index = index,
+            .cbuf_offset = offset,
             .count = Info::kGlobalTableSize,
             .is_written = program.info.stores_global_memory,
         });
