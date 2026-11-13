@@ -189,18 +189,6 @@ void Strided(EmitContext& ctx, u32 count, u32 threads, Id invocation, Func&& bod
     }
 }
 
-/// The raw stage buffer word of line `line` for element `element` (a vertex or a primitive).
-Id LineWord(EmitContext& ctx, Id array, Id element, u32 base, u32 num_lines, u32 line) {
-    const Id group{ctx.OpShiftRightLogical(ctx.U32[1], element, ctx.Const(5U))};
-    const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], element, ctx.Const(31U))};
-    const Id first{ctx.OpIAdd(
-        ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
-        ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(base)))};
-    return ctx.OpLoad(
-        ctx.U32[1],
-        SharedWord(ctx, array, ctx.OpIAdd(ctx.U32[1], first, ctx.Const(line * 32))));
-}
-
 /// A mesh workgroup takes records for its primitives' corners from the records buffer's allocator and writes them; the vertex
 /// stage's indirect draw covers the records taken (MESH_FALLBACK_DRAW_WORD). A task's flag first bounds its count.
 void MeshFallbackEpilogue(EmitContext& ctx) {
@@ -240,45 +228,66 @@ void MeshFallbackEpilogue(EmitContext& ctx) {
     Barrier(ctx);
     const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count)};
     If(ctx, ctx.OpINotEqual(ctx.U1, base, none), [&] {
-        const Id invocation{LocalInvocation(ctx)};
-        Strided(ctx, mesh.max_primitives, ctx.mesh_threads, invocation, [&](Id primitive) {
-            If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
-                for (u32 corner = 0; corner < corners; ++corner) {
-                    const Id byte{ctx.OpIAdd(
-                        ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
-                        ctx.Const(4U + corner))};
-                    // (an index byte the program left unwritten is held to the vertex count)
-                    const Id vertex{Clamped(
-                        ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, byte)),
-                        mesh.max_vertices)};
-                    const Id record{ctx.OpIAdd(
-                        ctx.U32[1], base,
-                        ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
-                                   ctx.Const(corner)))};
-                    const Id word{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS),
-                                             ctx.OpIMul(ctx.U32[1], record, ctx.Const(words)))};
-                    StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index, word),
-                              ctx.Const(1U));
-                    for (u32 line = 0; line < mesh.vertex_lines.size(); ++line) {
-                        const Id value{LineWord(ctx, ctx.mesh_attributes, vertex, 0,
-                                                static_cast<u32>(mesh.vertex_lines.size()), line)};
-                        StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                                  ctx.OpIAdd(ctx.U32[1], word, ctx.Const(1U + line))),
-                                  value);
-                    }
-                    for (u32 line = 0; line < mesh.primitive_lines.size(); ++line) {
-                        const Id value{LineWord(ctx, ctx.mesh_attributes, primitive,
-                                                ctx.mesh_primitive_base,
-                                                static_cast<u32>(mesh.primitive_lines.size()), line)};
-                        StoreWord(ctx, BufferWord(ctx, ctx.mesh_fallback_records_member_index,
-                                                  ctx.OpIAdd(ctx.U32[1], word,
-                                                             ctx.Const(static_cast<u32>(1U + mesh.vertex_lines.size()) +
-                                                                       line))),
-                                  value);
-                    }
-                }
-            });
+        // Adjacent invocations write adjacent words, keeping the existing record format and primitive order.
+        const Id counter{ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1]),
+                                                spv::StorageClass::Private)};
+        if (ctx.profile.supported_spirv >= 0x00010400) {
+            ctx.interfaces.push_back(counter);
+        }
+        ctx.OpStore(counter, LocalInvocation(ctx));
+        const Id total{ctx.OpIMul(ctx.U32[1], taken, ctx.Const(words))};
+        const Id first{ctx.OpIAdd(ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS),
+                                  ctx.OpIMul(ctx.U32[1], base, ctx.Const(words)))};
+        const Id header{ctx.OpLabel()}, check{ctx.OpLabel()}, body{ctx.OpLabel()},
+                 next{ctx.OpLabel()}, done{ctx.OpLabel()};
+        ctx.OpBranch(header);
+        ctx.AddLabel(header);
+        ctx.OpLoopMerge(done, next, spv::LoopControlMask::DontUnroll);
+        ctx.OpBranch(check);
+        ctx.AddLabel(check);
+        const Id at{ctx.OpLoad(ctx.U32[1], counter)};
+        ctx.OpBranchConditional(ctx.OpULessThan(ctx.U1, at, total), body, done);
+        ctx.AddLabel(body);
+        const Id record{ctx.OpUDiv(ctx.U32[1], at, ctx.Const(words))};
+        const Id line{ctx.OpUMod(ctx.U32[1], at, ctx.Const(words))};
+        const Id target{BufferWord(ctx, ctx.mesh_fallback_records_member_index,
+                                   ctx.OpIAdd(ctx.U32[1], first, at))};
+        If(ctx, ctx.OpIEqual(ctx.U1, line, ctx.u32_zero_value), [&] {
+            StoreWord(ctx, target, ctx.Const(1U));
         });
+        const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
+        if (vertex_lines) {
+            If(ctx, ctx.OpLogicalAnd(ctx.U1, ctx.OpUGreaterThan(ctx.U1, line, ctx.u32_zero_value),
+                                     ctx.OpULessThanEqual(ctx.U1, line, ctx.Const(vertex_lines))), [&] {
+                const Id vertex{Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map,
+                    ctx.OpIAdd(ctx.U32[1], record, ctx.Const(4U)))), mesh.max_vertices)};
+                const Id source{ctx.OpIAdd(ctx.U32[1],
+                    ctx.OpIMul(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U)),
+                               ctx.Const(vertex_lines * 32U)),
+                    ctx.OpIAdd(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U)),
+                               ctx.OpIMul(ctx.U32[1], ctx.OpISub(ctx.U32[1], line, ctx.Const(1U)), ctx.Const(32U))))};
+                StoreWord(ctx, target, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_attributes, source)));
+            });
+        }
+        const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
+        if (primitive_lines) {
+            If(ctx, ctx.OpUGreaterThan(ctx.U1, line, ctx.Const(vertex_lines)), [&] {
+                const Id primitive{ctx.OpUDiv(ctx.U32[1], record, ctx.Const(corners))};
+                const Id source{ctx.OpIAdd(ctx.U32[1], ctx.Const(ctx.mesh_primitive_base),
+                    ctx.OpIAdd(ctx.U32[1],
+                        ctx.OpIMul(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], primitive, ctx.Const(5U)),
+                                   ctx.Const(primitive_lines * 32U)),
+                        ctx.OpIAdd(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], primitive, ctx.Const(31U)),
+                            ctx.OpIMul(ctx.U32[1], ctx.OpISub(ctx.U32[1], line, ctx.Const(1U + vertex_lines)),
+                                       ctx.Const(32U)))))};
+                StoreWord(ctx, target, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_attributes, source)));
+            });
+        }
+        ctx.OpBranch(next);
+        ctx.AddLabel(next);
+        ctx.OpStore(counter, ctx.OpIAdd(ctx.U32[1], at, ctx.Const(std::max(ctx.mesh_threads, 1U))));
+        ctx.OpBranch(header);
+        ctx.AddLabel(done);
     });
 }
 
