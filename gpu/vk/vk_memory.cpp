@@ -421,6 +421,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
         return true;
     }
 #endif
+    if (!dev.external_memory_host) {
+        import_remember_failure(lo, hi);
+        return false;
+    }
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
@@ -618,8 +622,8 @@ uint64_t memory_guest_pages() {
 }
 
 bool memory_init() {
-    if (!dev.external_memory_host) {
-        logf("vk: no VK_EXT_external_memory_host: the guest memory cannot be imported (needed for now)");
+    if (!dev.external_memory_host && !dev.dma_buf_import) {
+        logf("vk: neither host memory nor dma-buf imports are supported");
         return false;
     }
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{
@@ -627,13 +631,17 @@ bool memory_init() {
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
-    hp.pNext = &p11;
     p11.pNext = &p13;
-    p2.pNext = &hp;
+    p2.pNext = &p11;
+    if (dev.external_memory_host) {
+        hp.pNext = &p11;
+        p2.pNext = &hp;
+    }
     vkGetPhysicalDeviceProperties2(dev.physical, &p2);
-    align = std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096);
+    align = dev.external_memory_host ? std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096) : 4096;
     max_import_size = std::min(p11.maxMemoryAllocationSize, p13.maxBufferSize);
-    logf("vk: guest memory imported in place (alignment %llu)", (unsigned long long)align);
+    logf("vk: guest memory imported through %s (alignment %llu)",
+         dev.external_memory_host ? "host pointers or dma-bufs" : "dma-bufs", (unsigned long long)align);
     return true;
 }
 
