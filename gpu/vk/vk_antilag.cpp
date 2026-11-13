@@ -21,6 +21,7 @@
 
 #include "vk_menu.h"
 
+#ifdef VK_AMD_anti_lag
 namespace mkwvk {
 
 namespace {
@@ -136,3 +137,15 @@ void antilag_input() {
 }
 
 } // namespace mkwvk
+#else
+namespace mkwvk {
+thread_local uint64_t antilag_present_frame = kAntiLagThisFrame;
+uint64_t antilag_frame() { return 0; }
+void antilag_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
+void antilag_device_features(void**&) {}
+void antilag_device_created() {}
+bool antilag_available() { return false; }
+void antilag_present() {}
+void antilag_input() {}
+} // namespace mkwvk
+#endif
