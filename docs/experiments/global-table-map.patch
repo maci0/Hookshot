@@ -1,0 +1,346 @@
+diff --git a/gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.h b/gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.h
+index e255817..21ef1d7 100644
+--- a/gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.h
++++ b/gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.h
+@@ -45,6 +45,8 @@ constexpr u32 MESH_FALLBACK_PAYLOAD_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET;
+ constexpr u32 MESH_FALLBACK_RECORDS_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET + 8;
+ constexpr u32 MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET + 16;
+ constexpr u32 MESH_FALLBACK_PUSH_END = MESH_FALLBACK_PUSH_OFFSET + 24;
++constexpr u32 GLOBAL_TABLE_MAP_PUSH_OFFSET = MESH_FALLBACK_PUSH_END;
++constexpr u32 GLOBAL_TABLE_MAP_PUSH_END = GLOBAL_TABLE_MAP_PUSH_OFFSET + 8;
+ // (hookshot) the fallback's mesh workgroups a draw can run: each a slot, a word of the payload buffer saying whether its task
+ // started it; then each task workgroup's payload. It was 1024, a record block each, and Ocarina's floor grass (433 tasks of
+ // 32 slots) lost 13 of 14 meshlets. At 16384, Hyrule Field's far trees (3cb76827/4f0c0b40: 721 tasks of 32) lost the tasks
+diff --git a/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index b2d08b9..f8fee0a 100644
+--- a/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1089,8 +1089,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
+     const bool follow_pointers{(stage == Stage::Compute || (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
+     Id ptr_u64{};
+-    if (follow_pointers) {
+-        wants_guest_pages = true;
++    wants_global_table_map = stage == Stage::Compute && profile.unified_descriptor_binding &&
++                             !ssbo_tables.empty() && env_on("RX_VK_TABLE_MAP");
++    if (follow_pointers || wants_global_table_map) {
++        wants_guest_pages |= follow_pointers;
+         if (profile.unified_descriptor_binding && rescaling_push_constants.value == 0) DefineRescalingInputPushConstant();   // (the table's address is in it)
+         AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+         AddExtension("SPV_KHR_physical_storage_buffer");
+@@ -1210,7 +1212,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         AddLabel(end_label);
+     }};
+     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
+-                               auto&& callback, bool add_label = true) {
++                               auto&& callback, bool add_label = true, Id load_type = {}) {
+         if (add_label) AddLabel();
+         // A helper may have only the page-table path, with no bound view of this type.
+         if (!Sirit::ValidId(element_pointer)) return;
+@@ -1219,6 +1221,11 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+         const Id table_counter{global_table_loop && add_label && !ssbo_tables.empty()
+                                    ? AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)
+                                    : Id{}};
++        const bool mapped_load{wants_global_table_map && Sirit::ValidId(load_type)};
++        const Id map_lo{mapped_load ? AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
++                                                      spv::StorageClass::Function) : Id{}};
++        const Id map_hi{mapped_load ? AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
++                                                      spv::StorageClass::Function) : Id{}};
+         if (Sirit::ValidId(table_counter)) AddCapability(spv::Capability::StorageBufferArrayDynamicIndexing);   // (the tables by k)
+         const size_t num_buffers{info.storage_buffers_descriptors.size()};
+         // (from Fritchii) Info::native_global_bounds: the candidate pointers the storage buffer pass bound for accesses it
+@@ -1313,6 +1320,55 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+             callback(ssbo_pointer);
+             AddLabel(else_label);
+         }
++        if (mapped_load) {
++            const Id root{OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64),
++                                                   rescaling_push_constants, Const(global_table_map_member_index)))};
++            const Id fast{OpLabel()}, slow{OpLabel()};
++            OpSelectionMerge(slow, spv::SelectionControlMask::MaskNone);
++            OpBranchConditional(OpINotEqual(U1, root, Constant(U64, u64{0})), fast, slow);
++            AddLabel(fast);
++            const Id header{OpIAdd(U64, root, Constant(U64, u64{(shift - 2U) * 16U}))};
++            const Id records{psb_load(U64, header, 8U)};
++            const Id count{psb_load(U32[1], OpIAdd(U64, header, Constant(U64, u64{8})), 4U)};
++            OpStore(map_lo, zero);
++            OpStore(map_hi, count);
++            const Id loop{OpLabel()}, check{OpLabel()}, body{OpLabel()}, next{OpLabel()}, miss{OpLabel()};
++            OpBranch(loop);
++            AddLabel(loop);
++            OpLoopMerge(miss, next, spv::LoopControlMask::DontUnroll);
++            OpBranch(check);
++            AddLabel(check);
++            const Id lo{OpLoad(U32[1], map_lo)}, hi{OpLoad(U32[1], map_hi)};
++            OpBranchConditional(OpULessThan(U1, lo, hi), body, miss);
++            AddLabel(body);
++            const Id mid{OpIAdd(U32[1], lo, OpShiftRightLogical(U32[1], OpISub(U32[1], hi, lo), Const(1U)))};
++            const Id record{OpIAdd(U64, records, OpUConvert(U64, OpShiftLeftLogical(U32[1], mid, Const(5U))))};
++            const Id first{psb_load(U64, record, 8U)};
++            const Id end{psb_load(U64, OpIAdd(U64, record, Constant(U64, u64{8})), 8U)};
++            const Id hit{OpLabel()}, search{OpLabel()};
++            OpSelectionMerge(search, spv::SelectionControlMask::MaskNone);
++            OpBranchConditional(OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, first), OpULessThan(U1, addr, end)), hit, search);
++            AddLabel(hit);
++            const Id base{psb_load(U64, OpIAdd(U64, record, Constant(U64, u64{16})), 8U)};
++            const Id backing{psb_load(U64, OpIAdd(U64, record, Constant(U64, u64{24})), 8U)};
++            const Id offset{OpBitwiseAnd(U32[1], OpUConvert(U32[1], OpISub(U64, addr, base)), Const(~((1U << shift) - 1U)))};
++            OpReturnValue(psb_load(load_type, OpIAdd(U64, backing, OpUConvert(U64, offset)), 4U));
++            AddLabel(search);
++            const Id before{OpULessThan(U1, addr, first)};
++            OpStore(map_lo, OpSelect(U32[1], before, lo, OpIAdd(U32[1], mid, Const(1U))));
++            OpStore(map_hi, OpSelect(U32[1], before, mid, hi));
++            OpBranch(next);
++            AddLabel(next);
++            OpBranch(loop);
++            AddLabel(miss);
++            record_miss(addr);
++            guest_lookup(addr, 1U << shift, [&](Id target) {
++                if (gp_level >= 3) OpReturnValue(psb_load(load_type, target, 4U));
++                else OpReturnValue(ConstantNull(load_type));
++            });
++            OpReturnValue(ConstantNull(load_type));
++            AddLabel(slow);
++        }
+         for (const GlobalTableVars& table : ssbo_tables) {   // (hookshot: Info::global_tables)
+             const Id table_id{table.vars.*ssbo_member};
+             if (!Sirit::ValidId(table_id) || !Sirit::ValidId(cbufs[table.cbuf_index].U32x2)) {
+@@ -1425,7 +1481,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+                                     function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+         define_body(ssbo_member, addr, element_pointer, shift,
+-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
++                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); }, true, type);
+         guest_lookup(addr, 1U << shift, [&](Id target) {
+             if (gp_level >= 3) OpReturnValue(psb_load(type, target, 4U));
+             else OpReturnValue(ConstantNull(type));
+@@ -1751,6 +1807,10 @@ void EmitContext::DefineRescalingInputPushConstant() {
+             mesh_fallback_indirect_input_member_index = member_index++;
+         }
+     }
++    if (wants_global_table_map) {
++        members.push_back(U64);
++        global_table_map_member_index = member_index++;
++    }
+     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
+     Decorate(push_constant_struct, spv::Decoration::Block);
+     Name(push_constant_struct, "ResolutionInfo");
+@@ -1789,6 +1849,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
+                            MESH_FALLBACK_INDIRECT_INPUT_PUSH_OFFSET);
+         }
+     }
++    if (wants_global_table_map) {
++        MemberDecorate(push_constant_struct, global_table_map_member_index, spv::Decoration::Offset,
++                       GLOBAL_TABLE_MAP_PUSH_OFFSET);
++        MemberName(push_constant_struct, global_table_map_member_index, "global_table_map");
++    }
+     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+     Name(rescaling_push_constants, "rescaling_push_constants");
+diff --git a/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h b/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 3c99091..7f2d093 100644
+--- a/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -304,6 +304,8 @@ public:
+     u32 rescaling_downfactor_member_index{};
+     u32 guest_pages_member_index{};   // (hookshot: GUEST_PAGES_PUSH_OFFSET's member, compute only)
+     bool wants_guest_pages{};
++    bool wants_global_table_map{};
++    u32 global_table_map_member_index{};
+     Id probe_log{};   // (EvilOOT, RX_VK_BLOCK_PROBE: the miss log's U32 storage buffer, per-block entry counters at word 128+)
+     u32 mesh_first_member_index{};    // (hookshot: MESH_FIRST_PUSH_OFFSET's member, task programs)
+     bool wants_mesh_first{};
+diff --git a/gpu/vk/vk_shader.cpp b/gpu/vk/vk_shader.cpp
+index 88616b1..5142983 100644
+--- a/gpu/vk/vk_shader.cpp
++++ b/gpu/vk/vk_shader.cpp
+@@ -1226,7 +1226,7 @@ uint64_t translator_stamp() {
+     // the programs already cached. tests/test_program_stamp_knobs.py checks the translator's switches against this list)
+     for (char** e = _environ; e && *e; e++)
+         for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_MARKERS",
+-                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "RX_VK_LOWER_SKIP", "EDEN_"})
++                                "RX_VK_TABLE_MAP", "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "RX_VK_LOWER_SKIP", "EDEN_"})
+             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
+     return h;
+ }
+diff --git a/nx2/bake_ds/bake_ds.cpp b/nx2/bake_ds/bake_ds.cpp
+index 5194747..293eaad 100644
+--- a/nx2/bake_ds/bake_ds.cpp
++++ b/nx2/bake_ds/bake_ds.cpp
+@@ -703,7 +703,7 @@ uint64_t disk_stamp(uint64_t translator_stamp, uint32_t depth) {   // (live: vk_
+     for (char** e = environ; e && *e; e++) {
+         for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK",
+                                 "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH",
+-                                "RX_VK_NO_INVARIANT", "RX_VK_MARKERS", "RX_VK_NO_CBUF_LOAD_RULE",
++                                "RX_VK_NO_INVARIANT", "RX_VK_MARKERS", "RX_VK_TABLE_MAP", "RX_VK_NO_CBUF_LOAD_RULE",
+                                 "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS",
+                                 "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "RX_VK_LOWER_SKIP", "EDEN_"})
+             if (!std::strncmp(*e, pre, std::strlen(pre))) add(*e, std::strlen(*e));
+diff --git a/gpu/vk/global_table_map.h b/gpu/vk/global_table_map.h
+new file mode 100644
+index 0000000..2cde2f6
+--- /dev/null
++++ b/gpu/vk/global_table_map.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <span>
++#include <vector>
++
++// Inputs are the shader-visible table words and the actual immutable descriptor snapshot.
++struct GlobalTableBinding {
++    uint64_t address, size_word, bound_bytes, device_address;
++};
++struct GlobalTableRange {
++    uint64_t lo, hi, guest_base, device_address;
++};
++static_assert(sizeof(GlobalTableRange) == 32);
++
++// False leaves the existing shader search responsible for the entire table set.
++inline bool make_global_table_map(std::span<const GlobalTableBinding> bindings, uint64_t alignment,
++                                  uint32_t width, std::vector<GlobalTableRange>& result) {
++    result.clear();
++    if ((width != 4 && width != 8 && width != 16) || alignment < 16 || (alignment & (alignment - 1)))
++        return false;
++    std::vector<GlobalTableRange> ranges;
++    std::vector<uint64_t> ends;
++    const uint64_t max = std::numeric_limits<uint64_t>::max();
++    for (const auto& b : bindings) {
++        const uint64_t base = b.address & ~(alignment - 1);
++        const uint64_t bytes = b.bound_bytes / width * width;
++        if (!bytes) continue;
++        if (!b.device_address || b.device_address % width || b.bound_bytes > UINT32_MAX ||
++            b.size_word > UINT32_MAX || base > max - bytes || b.address > max - b.size_word ||
++            b.device_address > max - bytes)
++            return false;
++        const uint64_t end = b.size_word ? std::min(base + bytes, b.address + b.size_word) : base + bytes;
++        if (end <= base) continue;
++        ranges.push_back({base, end, base, b.device_address});
++        ends.push_back(base);
++        ends.push_back(end);
++    }
++    std::sort(ends.begin(), ends.end());
++    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
++    for (size_t i = 1; i < ends.size(); ++i) {
++        const uint64_t lo = ends[i - 1], hi = ends[i];
++        for (const auto& r : ranges) {
++            if (lo < r.lo || lo >= r.hi) continue;
++            if (!result.empty() && result.back().hi == lo && result.back().guest_base == r.guest_base &&
++                result.back().device_address == r.device_address) {
++                result.back().hi = hi;
++            } else {
++                result.push_back({lo, hi, r.guest_base, r.device_address});
++            }
++            break; // First matching descriptor wins, even when another covers more of the load.
++        }
++    }
++    return true;
++}
+diff --git a/tests/global_table_map_test.cpp b/tests/global_table_map_test.cpp
+new file mode 100644
+index 0000000..a305771
+--- /dev/null
++++ b/tests/global_table_map_test.cpp
+@@ -0,0 +1,70 @@
++#include "global_table_map.h"
++#include <cassert>
++#include <random>
++
++static uint64_t original(std::span<const GlobalTableBinding> bindings, uint64_t alignment,
++                          uint32_t width, uint64_t address) {
++    for (const auto& b : bindings) {
++        const uint64_t base = b.address & ~(alignment - 1);
++        const uint64_t physical_end = base + b.bound_bytes / width * width;
++        const uint64_t end = b.size_word ? std::min(b.address + b.size_word, physical_end) : physical_end;
++        if (address >= base && address < end)
++            return b.device_address + (uint32_t(address - base) / width) * width;
++    }
++    return 0;
++}
++static uint64_t mapped(std::span<const GlobalTableRange> map, uint32_t width, uint64_t address) {
++    size_t lo = 0, hi = map.size();
++    while (lo < hi) {
++        const size_t mid = lo + (hi - lo) / 2;
++        const auto& r = map[mid];
++        if (address < r.lo) hi = mid;
++        else if (address >= r.hi) lo = mid + 1;
++        else return r.device_address + (uint32_t(address - r.guest_base) / width) * width;
++    }
++    return 0;
++}
++int main() {
++    std::mt19937_64 random(0x20261113);
++    for (unsigned trial = 0; trial < 1000; ++trial) {
++        const uint64_t high = trial % 2 ? 0x1000000000ull : 0;
++        const uint64_t alignment = trial % 3 ? 16 : 256;
++        std::vector<GlobalTableBinding> bs;
++        for (unsigned i = 0, n = random() % 65; i < n; ++i)
++            bs.push_back({high + random() % 4096, random() % 4 ? random() % 513 : 0,
++                          random() % 1025, 0x800000000ull + i * 0x10000ull});
++        for (uint32_t width : {4, 8, 16}) {
++            std::vector<GlobalTableRange> map;
++            assert(make_global_table_map(bs, alignment, width, map));
++            for (size_t i = 0; i < map.size(); ++i) {
++                assert(map[i].lo < map[i].hi);
++                if (i) assert(map[i-1].hi <= map[i].lo);
++            }
++            auto check = [&](uint64_t at) { assert(original(bs, alignment, width, at) == mapped(map, width, at)); };
++            for (unsigned i = 0; i < 128; ++i) check(high + random() % 6144);
++            for (const auto& r : map)
++                for (auto end : {r.lo, r.hi}) {
++                    if (end) check(end - 1);
++                    check(end);
++                    check(end + 1);
++                }
++        }
++    }
++    std::vector<GlobalTableRange> map;
++    // A logical end may lie inside the element read: do not split or reject that load.
++    const GlobalTableBinding crossing[] = {{0x1004,2,32,0x8000}, {0x1000,32,32,0x9000}};
++    assert(make_global_table_map(crossing,16,16,map));
++    assert(mapped(map,16,0x1005) == 0x8000);
++    assert(mapped(map,16,0x1006) == 0x9000);
++    // Width-specific truncation can change which descriptor wins.
++    const GlobalTableBinding short_range[] = {{0x1000,0,12,0x8000}, {0x1000,0,32,0x9000}};
++    assert(make_global_table_map(short_range,16,4,map) && mapped(map,4,0x1008) == 0x8008);
++    assert(make_global_table_map(short_range,16,16,map) && mapped(map,16,0x1008) == 0x9000);
++    for (auto bad : {GlobalTableBinding{0x1000,16,32,0},
++                     GlobalTableBinding{UINT64_MAX-8,32,32,0x8000},
++                     GlobalTableBinding{0x1000,0,0x100000000ull,0x8000},
++                     GlobalTableBinding{0x1000,16,32,UINT64_MAX-15}}) {
++        assert(!make_global_table_map(std::span(&bad,1),16,4,map));
++        assert(map.empty());
++    }
++}
+diff --git a/tests/test_global_table_map.py b/tests/test_global_table_map.py
+new file mode 100644
+index 0000000..0d09e79
+--- /dev/null
++++ b/tests/test_global_table_map.py
+@@ -0,0 +1,23 @@
++"""Differential tests for width-specific first-match global table maps."""
++import argparse
++from pathlib import Path
++import subprocess
++import tempfile
++
++RUN_ALL_ARGS = ['--cxx', '{cxx}']
++ROOT = Path(__file__).resolve().parents[1]
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--cxx', default='c++')
++    args = parser.parse_args()
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'maps'
++        subprocess.run([args.cxx, '-std=c++20', '-O1', '-Wall', '-Wextra', '-Werror',
++                        '-I' + str(ROOT / 'gpu/vk'), str(ROOT / 'tests/global_table_map_test.cpp'),
++                        '-o', str(exe)], check=True)
++        subprocess.run([str(exe)], check=True)
++    print('PASS: ordered overlapping maps match the original resolver for all load widths')
++
++if __name__ == '__main__':
++    main()
