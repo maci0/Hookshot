@@ -136,7 +136,12 @@ void gprof_run(VkCommandBuffer cmd, uint64_t key) {
         st->spans[st->run].items++;
         return;
     }
-    if (st->nq + 3 > kQ) return;
+    if (st->nq + 3 > kQ) {
+        // Close the previous program before untimed draws can be charged to it; reserve the pass's end query.
+        if (st->run >= 0) st->spans[st->run].qe = stamp(*st, cmd), st->run = -1;
+        dropped++;
+        return;
+    }
     const uint32_t q = stamp(*st, cmd);
     if (st->run >= 0) st->spans[st->run].qe = q;
     Span sp;
